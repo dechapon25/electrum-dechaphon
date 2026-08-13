@@ -3,7 +3,10 @@
 # file LICENCE or http://www.opensource.org/licenses/mit-license.php
 from enum import IntFlag, IntEnum
 import enum
-from typing import NamedTuple, List, Tuple, Mapping, Optional, TYPE_CHECKING, Union, Dict, Set, Sequence, FrozenSet
+from typing import (
+    NamedTuple, List, Tuple, Mapping, Optional, TYPE_CHECKING, Union, Dict, Set, Sequence, FrozenSet,
+    TypedDict,
+)
 import sys
 import time
 from functools import lru_cache
@@ -53,7 +56,12 @@ HTLC_OUTPUT_WEIGHT = 172
 FIXED_ANCHOR_SAT = 330
 
 LN_MAX_FUNDING_SAT_LEGACY = pow(2, 24) - 1
-DUST_LIMIT_MAX = 1000
+
+# We should tolerate higher-ish "dust_limit_sat" for channels,
+# however we cannot set this too high until we implement "max_dust_htlc_exposure_msat".
+# Until then, our exposure is (max_accepted_htlcs * dust_limit_sat).
+# ref https://github.com/lightning/bolts/commit/b456256b2e515359da3ff8bb14bb0337cac24969
+DUST_LIMIT_MAX = 5_000
 
 SCRIPT_TEMPLATE_FUNDING = [opcodes.OP_2, OPPushDataPubkey, OPPushDataPubkey, opcodes.OP_2, opcodes.OP_CHECKMULTISIG]
 
@@ -532,19 +540,24 @@ ZEROCONF_TIMEOUT = 60 * 10
 TIME_FOR_OFFERED_HTLCS_TO_GET_FAILED_OFFCHAIN_ON_RESTART = 30
 
 
+class RevStoreStorage(TypedDict):
+    index: int
+    buckets: dict[int, 'ShachainElement']
+
 class RevocationStore:
     # closely based on code in lightningnetwork/lnd
 
-    START_INDEX = 2 ** 48 - 1
+    NUM_BITS = 48
+    START_INDEX = 2 ** NUM_BITS - 1
 
-    def __init__(self, storage):
+    def __init__(self, storage: RevStoreStorage):
         if len(storage) == 0:
             storage['index'] = self.START_INDEX
             storage['buckets'] = {}
         self.storage = storage
         self.buckets = storage['buckets']
 
-    def add_next_entry(self, hsh):
+    def add_next_entry(self, hsh: bytes) -> None:
         index = self.storage['index']
         new_element = ShachainElement(index=index, secret=hsh)
         bucket = count_trailing_zeros(index)
@@ -553,12 +566,15 @@ class RevocationStore:
             e = shachain_derive(new_element, this_bucket.index)
             if e != this_bucket:
                 raise Exception("hash is not derivable: {} {} {}".format(e.secret.hex(), this_bucket.secret.hex(), this_bucket.index))
+        # update state
+        new_index = index - 1
+        assert new_index > 3  # arbitrary small positive int. could not hurt to fail a bit early, before underflow
         self.buckets[bucket] = new_element
-        self.storage['index'] = index - 1
+        self.storage['index'] = new_index
 
     def retrieve_secret(self, index: int) -> bytes:
-        assert index <= self.START_INDEX, index
-        for i in range(0, 49):
+        assert 0 < index <= self.START_INDEX, index
+        for i in range(0, self.NUM_BITS + 1):
             bucket = self.buckets.get(i)
             if bucket is None:
                 raise UnableToDeriveSecret()
@@ -570,17 +586,24 @@ class RevocationStore:
         raise UnableToDeriveSecret()
 
 
-def count_trailing_zeros(index):
+def count_trailing_zeros(index: int) -> int:
     """ BOLT-03 (where_to_put_secret) """
-    try:
-        return list(reversed(bin(index)[2:])).index("1")
-    except ValueError:
-        return 48
+    assert isinstance(index, int)
+    assert 0 < index <= RevocationStore.START_INDEX, f"{index=}"
+    tz = list(reversed(bin(index)[2:])).index("1")
+    assert 0 <= tz < RevocationStore.NUM_BITS
+    return tz
 
 
-def shachain_derive(element, to_index):
-    def get_prefix(index, pos):
-        mask = (1 << 64) - 1 - ((1 << pos) - 1)
+def shachain_derive(element: 'ShachainElement', to_index: int) -> 'ShachainElement':
+    assert isinstance(to_index, int)
+    assert 0 < to_index <= RevocationStore.START_INDEX, f"{to_index=}"
+    def get_prefix(index: int, pos: int) -> int:
+        assert isinstance(index, int)
+        assert isinstance(pos, int)
+        max_mask_len = 64  # TODO just use RevocationStore.NUM_BITS + 1 ?
+        assert max_mask_len > RevocationStore.NUM_BITS
+        mask = (1 << max_mask_len) - 1 - ((1 << pos) - 1)
         return index & mask
     from_index = element.index
     zeros = count_trailing_zeros(from_index)
@@ -603,8 +626,12 @@ class ShachainElement(NamedTuple):
         return ShachainElement(bfh(x[0]), int(x[1]))
 
 
-def get_per_commitment_secret_from_seed(seed: bytes, i: int, bits: int = 48) -> bytes:
+def get_per_commitment_secret_from_seed(seed: bytes, i: int, bits: int = RevocationStore.NUM_BITS) -> bytes:
     """Generate per commitment secret."""
+    assert isinstance(seed, bytes) and len(seed) == 32
+    assert isinstance(bits, int) and (0 <= bits <= RevocationStore.NUM_BITS)
+    assert isinstance(i, int)
+    assert 0 < i <= RevocationStore.START_INDEX, f"{i=}"
     per_commitment_secret = bytearray(seed)
     for bitindex in range(bits - 1, -1, -1):
         mask = 1 << bitindex
@@ -1119,18 +1146,18 @@ def make_commitment_outputs(
     has_anchors: bool,
     local_anchor_script: Optional[str],
     remote_anchor_script: Optional[str]
-) -> Tuple[List[PartialTxOutput], List[PartialTxOutput]]:
+) -> List[PartialTxOutput]:
 
-    # determine HTLC outputs and trim below dust to know if anchors need to be included
+    # convert htlcs to tx outputs
     htlc_outputs = []
     for script, htlc in htlcs:
         addr = bitcoin.redeem_script_to_address('p2wsh', script)
-        if htlc.amount_msat // 1000 > dust_limit_sat:
-            htlc_outputs.append(
-                PartialTxOutput(
-                    scriptpubkey=address_to_script(addr),
-                    value=htlc.amount_msat // 1000
-                ))
+        assert htlc.amount_msat // 1000 >= dust_limit_sat, f"{htlc} should have been trimmed before"
+        htlc_outputs.append(
+            PartialTxOutput(
+                scriptpubkey=address_to_script(addr),
+                value=htlc.amount_msat // 1000
+            ))
 
     # BOLT-03: "Base commitment transaction fees are extracted from the funder's amount;
     #           if that amount is insufficient, the entire amount of the funder's output is used."
@@ -1156,14 +1183,15 @@ def make_commitment_outputs(
             anchor_outputs.append(PartialTxOutput(scriptpubkey=remote_anchor_script, value=FIXED_ANCHOR_SAT))
 
     # if funder cannot afford feerate, their output might go negative, so take max(0, x) here
-    to_local_amt_msat = max(0, to_local_amt_msat)
-    to_remote_amt_msat = max(0, to_remote_amt_msat)
-    non_htlc_outputs.append(PartialTxOutput(scriptpubkey=local_script, value=to_local_amt_msat // 1000))
-    non_htlc_outputs.append(PartialTxOutput(scriptpubkey=remote_script, value=to_remote_amt_msat // 1000))
+    to_local_amt_sat = max(0, to_local_amt_msat) // 1000
+    to_remote_amt_sat = max(0, to_remote_amt_msat) // 1000
+    if to_local_amt_sat >= dust_limit_sat:
+        non_htlc_outputs.append(PartialTxOutput(scriptpubkey=local_script, value=to_local_amt_sat))
+    if to_remote_amt_sat >= dust_limit_sat:
+        non_htlc_outputs.append(PartialTxOutput(scriptpubkey=remote_script, value=to_remote_amt_sat))
 
-    c_outputs_filtered = list(filter(lambda x: x.value >= dust_limit_sat, non_htlc_outputs + htlc_outputs))
-    c_outputs = c_outputs_filtered + anchor_outputs
-    return htlc_outputs, c_outputs
+    c_outputs = non_htlc_outputs + htlc_outputs + anchor_outputs
+    return c_outputs
 
 
 def effective_htlc_tx_weight(success: bool, has_anchors: bool):
@@ -1272,7 +1300,7 @@ def make_commitment(
     htlcs = list(htlcs)
     htlcs.sort(key=lambda x: x.htlc.cltv_abs)
 
-    htlc_outputs, c_outputs_filtered = make_commitment_outputs(
+    c_outputs_filtered = make_commitment_outputs(
         fees_per_participant=fees_per_participant,
         local_amount_msat=local_amount,
         remote_amount_msat=remote_amount,

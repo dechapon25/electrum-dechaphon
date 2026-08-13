@@ -14,7 +14,8 @@ from electrum.logging import get_logger
 from electrum.network import TxBroadcastError, BestEffortRequestFailed
 from electrum.transaction import PartialTransaction, Transaction
 from electrum.util import (
-    InvalidPassword, event_listener, AddTransactionException, get_asyncio_loop, NotEnoughFunds, NoDynamicFeeEstimates
+    InvalidPassword, event_listener, AddTransactionException, get_asyncio_loop, NotEnoughFunds, NoDynamicFeeEstimates,
+    UserFacingException,
 )
 from electrum.lnutil import MIN_FUNDING_SAT
 from electrum.plugin import run_hook
@@ -81,6 +82,7 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
     peersUpdated = pyqtSignal()
     seedRetrieved = pyqtSignal()
     messageSigned = pyqtSignal([str], arguments=['signature'])
+    signMessageError = pyqtSignal([str], arguments=['error'])
 
     _network_signal = pyqtSignal(str, object)
 
@@ -200,16 +202,20 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
     @qt_event_listener
     def on_event_new_transaction(self, wallet: 'Abstract_Wallet', tx: Transaction):
         if wallet == self.wallet:
-            self._logger.info(f'new transaction {tx.txid()}')
+            self._logger.debug(f'new transaction {tx.txid()}')
             self.add_tx_notification(tx)
-            self.addressCoinModel.setDirty()
+            if self._addressCoinModel is not None:  # only setDirty if it was already initialized
+                self._addressCoinModel.setDirty()
             self.historyModel.setDirty()  # assuming wallet.is_up_to_date triggers after
-            self.balanceChanged.emit()
+            if self.wallet.is_up_to_date():
+                # don't update during sync as this recomputes the balance on each new tx, blocking the UI thread.
+                # on_event_wallet_updated emits balanceChanged once we are up-to-date.
+                self.balanceChanged.emit()
 
     @qt_event_listener
     def on_event_adb_tx_height_changed(self, adb, txid, old_height, new_height):
         if adb == self.wallet.adb:
-            self._logger.info(f'tx_height_changed {txid}. {old_height} -> {new_height}')
+            self._logger.debug(f'tx_height_changed {txid}. {old_height} -> {new_height}')
             self.historyModel.setDirty()  # assuming wallet.is_up_to_date triggers after
 
     @qt_event_listener
@@ -218,7 +224,8 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
         # is deleted along with multiple associated txs
         if wallet == self.wallet:
             self._logger.info(f'removed transaction {tx.txid()}')
-            self.addressCoinModel.setDirty()
+            if self._addressCoinModel is not None:
+                self._addressCoinModel.setDirty()
             self.historyModel.setDirty()
             self.balanceChanged.emit()
 
@@ -841,7 +848,11 @@ class QEWallet(AuthMixin, QObject, QtEventListener):
     @pyqtSlot(str, str)
     @auth_protect(message=_("Sign message?"))
     def signMessage(self, address, message):
-        sig = self.wallet.sign_message(address, message, self.password)
+        try:
+            sig = self.wallet.sign_message(address=address, message=message, password=self.password)
+        except UserFacingException as e:
+            self.signMessageError.emit(str(e))
+            return
         result = base64.b64encode(sig).decode('ascii')
         self.messageSigned.emit(result)
 

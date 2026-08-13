@@ -41,12 +41,14 @@ import threading
 import enum
 import asyncio
 from dataclasses import dataclass
+import base64
 
 import electrum_ecc as ecc
 from aiorpcx import ignore_after, run_in_thread
 
 from . import util, keystore, transaction, bitcoin, coinchooser, bip32, descriptor
 from . import constants
+from . import crypto
 from .i18n import _
 from .bip32 import BIP32Node, convert_bip32_intpath_to_strpath, convert_bip32_strpath_to_intpath
 from .logging import get_logger, Logger
@@ -55,7 +57,7 @@ from .util import (
     WalletFileException, BitcoinException, InvalidPassword, format_time, timestamp_to_datetime,
     Satoshis, Fiat, TxMinedInfo, quantize_feerate, OrderedDictWithIndex, multisig_type, parse_max_spend,
     OnchainHistoryItem, read_json_file, write_json_file, UserFacingException, FileImportFailed, EventListener,
-    event_listener
+    event_listener, is_hex_str,
 )
 from .bitcoin import COIN, is_address, is_minikey, relayfee, dust_threshold, DummyAddress, DummyAddressUsedInTxException
 from .keystore import (
@@ -3232,16 +3234,95 @@ class Abstract_Wallet(ABC, Logger, EventListener):
     def _update_password_for_keystore(self, old_pw: Optional[str], new_pw: Optional[str]) -> None:
         pass
 
-    def sign_message(self, address: str, message: str, password) -> bytes:
+    def sign_message(self, *, address: str, message: str, password, strip_inputs: bool = True) -> bytes:
+        """Caller must handle UserFacingException."""
+        assert isinstance(address, str), f"address must be str. got {type(address)}"
+        assert isinstance(message, str), f"message must be str. got {type(message)}"
+        if strip_inputs:
+            # stripping whitespaces leads to better UX for GUIs, but it's counter-productive for CLI
+            address = address.strip()
+            message = message.strip()
+        if not bitcoin.is_address(address):
+            raise UserFacingException(_("Invalid Bitcoin address."))
+        if self.is_watching_only():
+            raise UserFacingException(_("This is a watching-only wallet."))
+        if not self.is_mine(address):
+            raise UserFacingException(_("Address not in wallet."))
+        txin_type = self.get_txin_type(address)
+        assert txin_type != "address"  # logic error, as this implies watching-only
+        if txin_type not in ['p2pkh', 'p2wpkh', 'p2wpkh-p2sh']:
+            raise UserFacingException(
+                _("Cannot sign messages with this type of address:") +
+                " " + txin_type + "\n\n"
+                + _("Signing with an address actually means signing with the corresponding "
+                     "private key, and verifying with the corresponding public key. The "
+                     "address you have entered does not have a unique public key, so these "
+                     "operations cannot be performed.") + "\n\n"
+                + _("The operation is undefined. Not just in Electrum, but in general.")
+            )
         index = self.get_address_index(address)
-        script_type = self.get_txin_type(address)
-        assert script_type != "address"
-        return self.keystore.sign_message(index, message, password, script_type=script_type)
+        return self.keystore.sign_message(index, message, password, script_type=txin_type)
 
-    def decrypt_message(self, pubkey: str, message, password) -> bytes:
-        addr = self.pubkeys_to_address([pubkey])
-        index = self.get_address_index(addr)
-        return self.keystore.decrypt_message(index, message, password)
+    @classmethod
+    def verify_message(cls, *, address: str, signature: str, message: str, strip_inputs: bool = True) -> bool:
+        """Caller must handle UserFacingException."""
+        assert isinstance(address, str), f"address must be str. got {type(address)}"
+        assert isinstance(signature, str), f"signature must be str. got {type(signature)}"
+        assert isinstance(message, str), f"message must be str. got {type(message)}"
+        if strip_inputs:
+            # stripping whitespaces leads to better UX for GUIs, but it's counter-productive for CLI
+            address = address.strip()
+            signature = signature.strip()
+            message = message.strip()
+        if not is_address(address):
+            raise UserFacingException(_("Invalid Bitcoin address."))
+        try:
+            sig = base64.b64decode(signature, validate=True)
+        except ValueError:
+            # note: unicode chars in signature would result in ValueError,
+            #       so it is insufficient to catch binascii.Error(ValueError)
+            return False
+        message = util.to_bytes(message)
+        return bitcoin.verify_usermessage_with_address(address, sig, message)
+
+    def decrypt_message(self, *, pubkey: str, message: str, password) -> bytes:
+        """Caller must handle UserFacingException."""
+        assert isinstance(pubkey, str), f"pubkey must be str. got {type(pubkey)}"
+        assert isinstance(message, str), f"message must be str. got {type(message)}"
+        if self.is_watching_only():
+            raise UserFacingException(_("This is a watching-only wallet."))
+        if isinstance(self, Multisig_Wallet):  # FIXME does not work with multisig wallets. (see #5856)
+            raise UserFacingException(_("Decrypting messages is currently not implemented for multisig wallets."))
+        if not is_hex_str(pubkey):
+            raise UserFacingException(f"pubkey must be a hex string instead of {type(pubkey)}")
+        if isinstance(self, Imported_Wallet):
+            # this branch is significantly faster. Imported_Wallet.pubkeys_to_address is slow.
+            addr_index = pubkey
+            assert isinstance(self.keystore, keystore.Imported_KeyStore)
+            if pubkey not in self.keystore.keypairs:
+                raise UserFacingException(_("Pubkey unrelated to wallet."))
+        else:
+            addr = self.pubkeys_to_address([pubkey])  # note: broken for multisig
+            addr_index = self.get_address_index(addr)
+            if addr_index is None:
+                raise UserFacingException(_("Pubkey unrelated to wallet."))
+        return self.keystore.decrypt_message(addr_index, message, password)
+
+    @classmethod
+    def encrypt_message(cls, *, pubkey: str, message: str) -> str:
+        """Caller must handle UserFacingException."""
+        assert isinstance(pubkey, str), f"pubkey must be str. got {type(pubkey)}"
+        assert isinstance(message, str), f"message must be str. got {type(message)}"
+        message = util.to_bytes(message)
+        if not is_hex_str(pubkey):
+            raise UserFacingException(f"pubkey must be a hex string instead of {type(pubkey)}")
+        pubkey_bytes = bytes.fromhex(pubkey)
+        try:
+            eckey = ecc.ECPubkey(pubkey_bytes)
+        except ecc.InvalidECPointException as e:
+            raise UserFacingException(_("Invalid Public key")) from e
+        encrypted = crypto.ecies_encrypt_message(eckey, message)
+        return encrypted.decode("ascii")
 
     @abstractmethod
     def pubkeys_to_address(self, pubkeys: Sequence[str]) -> Optional[str]:
@@ -3388,6 +3469,7 @@ class Abstract_Wallet(ABC, Logger, EventListener):
 
         rl = TxSighashRiskLevel
         hintmap = {
+            -1:                   (rl.INSANE_SIGHASH, _('Input {} is using an unknown sighash.')),
             0:                    (rl.SAFE,           None),
             Sighash.NONE:         (rl.INSANE_SIGHASH, _('Input {} is marked SIGHASH_NONE.')),
             Sighash.SINGLE:       (rl.WEIRD_SIGHASH,  _('Input {} is marked SIGHASH_SINGLE.')),
@@ -3404,8 +3486,12 @@ class Abstract_Wallet(ABC, Logger, EventListener):
                 sh_base = txin.sighash & (Sighash.ANYONECANPAY ^ 0xff)
                 sh_acp = txin.sighash & Sighash.ANYONECANPAY
                 for sh in [sh_base, sh_acp]:
-                    if msg := hintmap[sh][1]:
-                        risk_level = hintmap[sh][0]
+                    try:
+                        hint = hintmap[sh]
+                    except KeyError:
+                        hint = hintmap[-1]  # "unknown sighash"
+                    if msg := hint[1]:
+                        risk_level = hint[0]
                         header = _('Fatal') if TxSighashDanger(risk_level=risk_level).needs_reject() else _('Warning')
                         shd = TxSighashDanger(
                             risk_level=risk_level,
@@ -3715,8 +3801,11 @@ class Abstract_Wallet(ABC, Logger, EventListener):
 
     def get_user_notifications_for_new_txns(self, txns: Sequence[Transaction]) -> Sequence[str]:
         notifications = []
-        # Combine the transactions if there are at least three
-        if len(txns) >= 3:
+        if len(txns) > 20:
+            # skip the delta calculation if there are many txs, otherwise it may block the UI for seconds
+            notifications.append(_('{} new transactions').format(len(txns)))
+        elif len(txns) >= 3:
+            # Combine the transactions if there are at least three
             total_amount = 0
             total_debit = 0
             total_credit = 0
@@ -3993,10 +4082,6 @@ class Imported_Wallet(Simple_Wallet):
             if self.db.get_imported_address(addr)['pubkey'] == pubkey:
                 return addr
         return None
-
-    def decrypt_message(self, pubkey: str, message, password) -> bytes:
-        # this is significantly faster than the implementation in the superclass
-        return self.keystore.decrypt_message(pubkey, message, password)
 
 
 class Deterministic_Wallet(Abstract_Wallet):
