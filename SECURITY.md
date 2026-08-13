@@ -1,4 +1,4 @@
-Two main ways to responsibly report security issues privately:
+Two notbtc ways to responsibly report security issues privately:
 
 1. (preferred) if you have a GitHub account, use the built-in
   ["Report a vulnerability"](https://github.com/spesmilo/electrum/security/advisories/new)
